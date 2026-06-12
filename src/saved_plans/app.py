@@ -51,6 +51,8 @@ def _handle_request(event, repository=None):
         return _list_plans(event, user_id, repository)
     if method == "GET" and itinerary_id and path.endswith(f"/{itinerary_id}"):
         return _get_plan(user_id, itinerary_id, repository)
+    if method == "DELETE" and itinerary_id and path.endswith(f"/{itinerary_id}"):
+        return _delete_plan(user_id, itinerary_id, repository)
     if method == "PUT" and itinerary_id and path.endswith(f"/{itinerary_id}/reactions/like"):
         return _set_like(user_id, itinerary_id, True, repository)
     if method == "DELETE" and itinerary_id and path.endswith(f"/{itinerary_id}/reactions/like"):
@@ -88,6 +90,15 @@ def _get_plan(user_id, itinerary_id, repository):
     if not plan:
         raise SavedPlanRequestError(404, "ITINERARY_NOT_FOUND", "Saved itinerary was not found")
     return json_response(200, _public_detail(plan))
+
+
+def _delete_plan(user_id, itinerary_id, repository):
+    result = repository.delete_owned(user_id, itinerary_id, _now_iso())
+    if result == "not_found":
+        raise SavedPlanRequestError(404, "ITINERARY_NOT_FOUND", "Saved itinerary was not found")
+    if result == "forbidden":
+        raise SavedPlanRequestError(403, "FORBIDDEN", "You cannot delete another user's saved itinerary")
+    return empty_response(204)
 
 
 def _set_like(user_id, itinerary_id, liked, repository):

@@ -26,10 +26,18 @@ class RdsDataSavedPlanRepository:
                 if existing.get("snapshotHash") != snapshot_hash:
                     raise IdempotencyConflictError()
                 return existing, True
+            deleted = self._find_deleted_by_idempotency_key(user_id, idempotency_key)
+            if deleted:
+                if deleted.get("snapshotHash") != snapshot_hash:
+                    raise IdempotencyConflictError()
+                return self._restore(deleted["itineraryId"], user_id, payload, snapshot_hash, now), False
 
         existing = self._find_by_recommendation_hash(user_id, payload.get("sourceRecommendationId"), snapshot_hash)
         if existing:
             return existing, True
+        deleted = self._find_deleted_by_recommendation_hash(user_id, payload.get("sourceRecommendationId"), snapshot_hash)
+        if deleted:
+            return self._restore(deleted["itineraryId"], user_id, payload, snapshot_hash, now), False
 
         plan_id = str(uuid.uuid4())
         plan = _build_plan(plan_id, user_id, payload, snapshot_hash, now)
@@ -49,6 +57,35 @@ class RdsDataSavedPlanRepository:
         )
         return plan, False
 
+    def _restore(self, plan_id, user_id, payload, snapshot_hash, now):
+        plan = _build_plan(plan_id, user_id, payload, snapshot_hash, now)
+        self.rds.execute(
+            f"""
+            UPDATE {self.table_name}
+            SET source_recommendation_id = :source_recommendation_id,
+                idempotency_key = :idempotency_key,
+                snapshot_hash = :snapshot_hash,
+                title = :title,
+                summary = :summary,
+                destination_json = :destination_json,
+                trip_type = :trip_type,
+                duration_label = :duration_label,
+                themes_json = :themes_json,
+                conditions_snapshot_json = :conditions_snapshot_json,
+                request_summary = :request_summary,
+                itinerary_json = :itinerary_json,
+                alternative_itinerary_json = :alternative_itinerary_json,
+                is_liked = :is_liked,
+                saved_at = :saved_at,
+                updated_at = :updated_at,
+                deleted_at = NULL
+            WHERE id = :id AND user_id = :user_id
+            """,
+            _row_params(plan),
+            include_result_metadata=False,
+        )
+        return plan
+
     def list_by_user(self, user_id, limit=20):
         rows = self.rds.fetch_all(
             f"""
@@ -56,6 +93,7 @@ class RdsDataSavedPlanRepository:
                    themes_json, itinerary_json, is_liked, saved_at, updated_at
             FROM {self.table_name}
             WHERE user_id = :user_id
+              AND deleted_at IS NULL
             ORDER BY saved_at DESC
             LIMIT :limit
             """,
@@ -65,10 +103,30 @@ class RdsDataSavedPlanRepository:
 
     def get_owned(self, user_id, plan_id):
         row = self.rds.fetch_one(
-            f"SELECT * FROM {self.table_name} WHERE id = :id AND user_id = :user_id",
+            f"SELECT * FROM {self.table_name} WHERE id = :id AND user_id = :user_id AND deleted_at IS NULL",
             {"id": plan_id, "user_id": user_id},
         )
         return _plan_from_row(row) if row else None
+
+    def delete_owned(self, user_id, plan_id, now):
+        row = self.rds.fetch_one(
+            f"SELECT user_id, deleted_at FROM {self.table_name} WHERE id = :id",
+            {"id": plan_id},
+        )
+        if not row or row.get("deleted_at"):
+            return "not_found"
+        if row.get("user_id") != user_id:
+            return "forbidden"
+        self.rds.execute(
+            f"""
+            UPDATE {self.table_name}
+            SET deleted_at = :deleted_at, updated_at = :updated_at
+            WHERE id = :id AND user_id = :user_id AND deleted_at IS NULL
+            """,
+            {"id": plan_id, "user_id": user_id, "deleted_at": now, "updated_at": now},
+            include_result_metadata=False,
+        )
+        return "deleted"
 
     def set_like(self, user_id, plan_id, liked, now):
         plan = self.get_owned(user_id, plan_id)
@@ -79,7 +137,7 @@ class RdsDataSavedPlanRepository:
             f"""
             UPDATE {self.table_name}
             SET is_liked = :is_liked, updated_at = :updated_at
-            WHERE id = :id AND user_id = :user_id
+            WHERE id = :id AND user_id = :user_id AND deleted_at IS NULL
             """,
             {"id": plan_id, "user_id": user_id, "is_liked": bool(liked), "updated_at": now},
             include_result_metadata=False,
@@ -90,7 +148,24 @@ class RdsDataSavedPlanRepository:
 
     def _find_by_idempotency_key(self, user_id, idempotency_key):
         row = self.rds.fetch_one(
-            f"SELECT * FROM {self.table_name} WHERE user_id = :user_id AND idempotency_key = :idempotency_key",
+            f"""
+            SELECT * FROM {self.table_name}
+            WHERE user_id = :user_id
+              AND idempotency_key = :idempotency_key
+              AND deleted_at IS NULL
+            """,
+            {"user_id": user_id, "idempotency_key": idempotency_key},
+        )
+        return _plan_from_row(row) if row else None
+
+    def _find_deleted_by_idempotency_key(self, user_id, idempotency_key):
+        row = self.rds.fetch_one(
+            f"""
+            SELECT * FROM {self.table_name}
+            WHERE user_id = :user_id
+              AND idempotency_key = :idempotency_key
+              AND deleted_at IS NOT NULL
+            """,
             {"user_id": user_id, "idempotency_key": idempotency_key},
         )
         return _plan_from_row(row) if row else None
@@ -104,6 +179,22 @@ class RdsDataSavedPlanRepository:
             WHERE user_id = :user_id
               AND source_recommendation_id = :source_recommendation_id
               AND snapshot_hash = :snapshot_hash
+              AND deleted_at IS NULL
+            """,
+            {"user_id": user_id, "source_recommendation_id": source_recommendation_id, "snapshot_hash": snapshot_hash},
+        )
+        return _plan_from_row(row) if row else None
+
+    def _find_deleted_by_recommendation_hash(self, user_id, source_recommendation_id, snapshot_hash):
+        if not source_recommendation_id:
+            return None
+        row = self.rds.fetch_one(
+            f"""
+            SELECT * FROM {self.table_name}
+            WHERE user_id = :user_id
+              AND source_recommendation_id = :source_recommendation_id
+              AND snapshot_hash = :snapshot_hash
+              AND deleted_at IS NOT NULL
             """,
             {"user_id": user_id, "source_recommendation_id": source_recommendation_id, "snapshot_hash": snapshot_hash},
         )
@@ -116,41 +207,70 @@ class InMemorySavedPlanRepository:
         self.plans = {}
 
     def save(self, user_id, payload, snapshot_hash, now=None):
+        now = now or self.now
         idempotency_key = payload.get("idempotencyKey")
         if idempotency_key:
             for plan in self.plans.values():
-                if plan["userId"] == user_id and plan.get("idempotencyKey") == idempotency_key:
+                if plan["userId"] == user_id and not plan.get("deletedAt") and plan.get("idempotencyKey") == idempotency_key:
                     if plan["snapshotHash"] != snapshot_hash:
                         raise IdempotencyConflictError()
                     return dict(plan), True
+            for plan in self.plans.values():
+                if plan["userId"] == user_id and plan.get("deletedAt") and plan.get("idempotencyKey") == idempotency_key:
+                    if plan["snapshotHash"] != snapshot_hash:
+                        raise IdempotencyConflictError()
+                    restored = _build_plan(plan["itineraryId"], user_id, payload, snapshot_hash, now)
+                    self.plans[plan["itineraryId"]] = restored
+                    return dict(restored), False
 
         for plan in self.plans.values():
             if (
                 plan["userId"] == user_id
+                and not plan.get("deletedAt")
                 and plan.get("sourceRecommendationId") == payload.get("sourceRecommendationId")
                 and plan["snapshotHash"] == snapshot_hash
             ):
                 return dict(plan), True
+        for plan in self.plans.values():
+            if (
+                plan["userId"] == user_id
+                and plan.get("deletedAt")
+                and plan.get("sourceRecommendationId") == payload.get("sourceRecommendationId")
+                and plan["snapshotHash"] == snapshot_hash
+            ):
+                restored = _build_plan(plan["itineraryId"], user_id, payload, snapshot_hash, now)
+                self.plans[plan["itineraryId"]] = restored
+                return dict(restored), False
 
         plan_id = f"plan-{len(self.plans) + 1}"
-        plan = _build_plan(plan_id, user_id, payload, snapshot_hash, now or self.now)
+        plan = _build_plan(plan_id, user_id, payload, snapshot_hash, now)
         self.plans[plan_id] = plan
         return dict(plan), False
 
     def list_by_user(self, user_id, limit=20):
-        plans = [plan for plan in self.plans.values() if plan["userId"] == user_id]
+        plans = [plan for plan in self.plans.values() if plan["userId"] == user_id and not plan.get("deletedAt")]
         plans.sort(key=lambda plan: plan["savedAt"], reverse=True)
         return [_summary(plan) for plan in plans[:limit]]
 
     def get_owned(self, user_id, plan_id):
         plan = self.plans.get(plan_id)
-        if not plan or plan["userId"] != user_id:
+        if not plan or plan["userId"] != user_id or plan.get("deletedAt"):
             return None
         return dict(plan)
 
+    def delete_owned(self, user_id, plan_id, now=None):
+        plan = self.plans.get(plan_id)
+        if not plan or plan.get("deletedAt"):
+            return "not_found"
+        if plan["userId"] != user_id:
+            return "forbidden"
+        plan["deletedAt"] = now or self.now
+        plan["updatedAt"] = now or self.now
+        return "deleted"
+
     def set_like(self, user_id, plan_id, liked, now=None):
         plan = self.plans.get(plan_id)
-        if not plan or plan["userId"] != user_id:
+        if not plan or plan["userId"] != user_id or plan.get("deletedAt"):
             return None, False
         changed = bool(plan.get("isLiked")) != bool(liked)
         plan["isLiked"] = bool(liked)
@@ -182,6 +302,7 @@ def _build_plan(plan_id, user_id, payload, snapshot_hash, now):
         "isLiked": False,
         "savedAt": now,
         "updatedAt": now,
+        "deletedAt": None,
     }
 
 
@@ -251,6 +372,7 @@ def _plan_from_row(row):
         "isLiked": bool(row.get("is_liked")),
         "savedAt": row.get("saved_at"),
         "updatedAt": row.get("updated_at"),
+        "deletedAt": row.get("deleted_at"),
     }
 
 

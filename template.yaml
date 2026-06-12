@@ -110,7 +110,7 @@ Resources:
         Authorizers:
           LovvTokenAuthorizer:
             FunctionArn: !GetAtt AuthAuthorizerFunction.Arn
-            AuthorizerPayloadFormatVersion: 2.0
+            AuthorizerPayloadFormatVersion: '2.0'
             EnableSimpleResponses: true
             Identity:
               Headers:
@@ -321,6 +321,14 @@ Resources:
           Properties:
             ApiId: !Ref LovvHttpApi
             Method: GET
+            Path: /api/v1/me/itineraries/{itineraryId}
+            Auth:
+              Authorizer: LovvTokenAuthorizer
+        DeleteItinerary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LovvHttpApi
+            Method: DELETE
             Path: /api/v1/me/itineraries/{itineraryId}
             Auth:
               Authorizer: LovvTokenAuthorizer

@@ -159,6 +159,115 @@ class SavedPlansAppTest(unittest.TestCase):
         self.assertEqual(response["statusCode"], 404)
         self.assertEqual(body["error"]["code"], "ITINERARY_NOT_FOUND")
 
+    def test_deletes_owned_saved_plan_and_removes_it_from_list(self):
+        saved = handle_request(make_event("POST", "/api/v1/me/itineraries", save_payload()), repository=self.repository)
+        itinerary_id = json.loads(saved["body"])["itineraryId"]
+
+        response = handle_request(
+            make_event(
+                "DELETE",
+                f"/api/v1/me/itineraries/{itinerary_id}",
+                path_parameters={"itineraryId": itinerary_id},
+            ),
+            repository=self.repository,
+        )
+        listed = handle_request(make_event("GET", "/api/v1/me/itineraries"), repository=self.repository)
+        detail = handle_request(
+            make_event(
+                "GET",
+                f"/api/v1/me/itineraries/{itinerary_id}",
+                path_parameters={"itineraryId": itinerary_id},
+            ),
+            repository=self.repository,
+        )
+        list_body = json.loads(listed["body"])
+
+        self.assertEqual(response["statusCode"], 204)
+        self.assertEqual(response.get("body", ""), "")
+        self.assertEqual(list_body["items"], [])
+        self.assertEqual(detail["statusCode"], 404)
+        self.assertIn(itinerary_id, self.repository.plans)
+        self.assertIsNotNone(self.repository.plans[itinerary_id]["deletedAt"])
+
+    def test_delete_rejects_another_users_saved_plan(self):
+        saved = handle_request(make_event("POST", "/api/v1/me/itineraries", save_payload()), repository=self.repository)
+        itinerary_id = json.loads(saved["body"])["itineraryId"]
+
+        response = handle_request(
+            make_event(
+                "DELETE",
+                f"/api/v1/me/itineraries/{itinerary_id}",
+                user_id="user-2",
+                path_parameters={"itineraryId": itinerary_id},
+            ),
+            repository=self.repository,
+        )
+        body = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 403)
+        self.assertEqual(body["error"]["code"], "FORBIDDEN")
+        self.assertIn(itinerary_id, self.repository.plans)
+
+    def test_delete_missing_saved_plan_returns_404(self):
+        response = handle_request(
+            make_event(
+                "DELETE",
+                "/api/v1/me/itineraries/missing-plan",
+                path_parameters={"itineraryId": "missing-plan"},
+            ),
+            repository=self.repository,
+        )
+        body = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 404)
+        self.assertEqual(body["error"]["code"], "ITINERARY_NOT_FOUND")
+
+    def test_resaves_soft_deleted_plan_without_unique_key_collision(self):
+        saved = handle_request(make_event("POST", "/api/v1/me/itineraries", save_payload()), repository=self.repository)
+        itinerary_id = json.loads(saved["body"])["itineraryId"]
+        handle_request(
+            make_event(
+                "DELETE",
+                f"/api/v1/me/itineraries/{itinerary_id}",
+                path_parameters={"itineraryId": itinerary_id},
+            ),
+            repository=self.repository,
+        )
+
+        restored = handle_request(make_event("POST", "/api/v1/me/itineraries", save_payload()), repository=self.repository)
+        restored_body = json.loads(restored["body"])
+        listed = handle_request(make_event("GET", "/api/v1/me/itineraries"), repository=self.repository)
+        list_body = json.loads(listed["body"])
+
+        self.assertEqual(restored["statusCode"], 201)
+        self.assertFalse(restored_body["duplicate"])
+        self.assertEqual(restored_body["itineraryId"], itinerary_id)
+        self.assertIsNone(self.repository.plans[itinerary_id]["deletedAt"])
+        self.assertEqual(len(list_body["items"]), 1)
+        self.assertEqual(list_body["items"][0]["itineraryId"], itinerary_id)
+
+    def test_resave_soft_deleted_plan_rejects_idempotency_conflict(self):
+        saved = handle_request(make_event("POST", "/api/v1/me/itineraries", save_payload()), repository=self.repository)
+        itinerary_id = json.loads(saved["body"])["itineraryId"]
+        handle_request(
+            make_event(
+                "DELETE",
+                f"/api/v1/me/itineraries/{itinerary_id}",
+                path_parameters={"itineraryId": itinerary_id},
+            ),
+            repository=self.repository,
+        )
+
+        response = handle_request(
+            make_event("POST", "/api/v1/me/itineraries", save_payload(title="conflicting title")),
+            repository=self.repository,
+        )
+        body = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 409)
+        self.assertEqual(body["error"]["code"], "IDEMPOTENCY_KEY_CONFLICT")
+        self.assertIsNotNone(self.repository.plans[itinerary_id]["deletedAt"])
+
     def test_like_and_unlike_are_idempotent(self):
         saved = handle_request(make_event("POST", "/api/v1/me/itineraries", save_payload()), repository=self.repository)
         itinerary_id = json.loads(saved["body"])["itineraryId"]
