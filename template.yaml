@@ -544,6 +544,12 @@ Resources:
             ApiId: !Ref LovvHttpApi
             Method: GET
             Path: /api/v1/me/itineraries/{itineraryId}
+        DeleteItinerary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LovvHttpApi
+            Method: DELETE
+            Path: /api/v1/me/itineraries/{itineraryId}
         LikeItinerary:
           Type: HttpApi
           Properties:
