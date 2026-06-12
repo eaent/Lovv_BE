@@ -10,7 +10,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 
-from auth.provider_verifier import ProviderValidationError, ProviderVerifier
+from auth.provider_verifier import ProviderIdentity, ProviderValidationError, ProviderVerifier
 from auth.session_repository import DynamoDbSessionRepository, SessionRepositoryError
 from auth.user_repository import RdsDataUserRepository, UserRepositoryError
 from preferences.app import public_preference
@@ -40,6 +40,13 @@ def _handle_request(event, provider_verifier=None, user_repository=None, session
 
     if method == "OPTIONS":
         return json_response(200, {})
+    if method == "POST" and path == "/api/v1/auth/cognito/session":
+        return _handle_cognito_session(
+            event,
+            user_repository,
+            session_repository,
+            preference_repository,
+        )
     if method == "POST" and path == "/api/v1/auth/google":
         return _handle_social_login(
             "google",
@@ -129,6 +136,77 @@ def _handle_social_login(provider, event, provider_verifier, user_repository, se
             "preferences": preference_state["preferences"],
             "onboardingCompleted": preference_state["onboardingCompleted"],
             "linkedProvider": provider,
+        },
+        headers={"Set-Cookie": _session_cookie(refresh_token, _refresh_ttl_seconds())},
+    )
+
+
+def _handle_cognito_session(event, user_repository, session_repository, preference_repository):
+    claims = _cognito_authorizer_claims(event)
+    if not claims:
+        raise AuthRequestError(401, "UNAUTHORIZED", "Missing Cognito claims")
+
+    cognito_sub = claims.get("sub")
+    if not cognito_sub:
+        raise AuthRequestError(422, "COGNITO_CLAIM_MAPPING_FAILED", "Cognito subject claim is required")
+
+    user_repository = user_repository or RdsDataUserRepository.from_env()
+    session_repository = session_repository or DynamoDbSessionRepository.from_env()
+    preference_repository = preference_repository or RdsDataPreferenceRepository.from_env()
+
+    email_verified = _claim_bool(claims.get("email_verified"))
+    identity = ProviderIdentity(
+        provider="cognito",
+        provider_user_id=str(cognito_sub),
+        email=claims.get("email"),
+        email_verified=email_verified,
+        display_name=_cognito_display_name(claims),
+        avatar_url=claims.get("picture"),
+    )
+    now_iso = _now_iso()
+    user_result = user_repository.upsert_from_provider(identity, now_iso)
+    roles = ["R-USER"]
+    user = dict(user_result.user)
+    user["roles"] = roles
+    user["cognitoSub"] = str(cognito_sub)
+    user["emailVerified"] = email_verified
+
+    refresh_token = secrets.token_urlsafe(48)
+    expires_at_epoch = _now_epoch() + _refresh_ttl_seconds()
+    refresh_token_hash = _hash_token(refresh_token)
+    session = session_repository.create_session(
+        user_id=user["userId"],
+        provider="cognito",
+        refresh_token_hash=refresh_token_hash,
+        expires_at_epoch=expires_at_epoch,
+        now_epoch=_now_epoch(),
+        user_agent=_user_agent(event),
+        ip_address=_source_ip(event),
+    )
+    access_token = create_access_token(
+        user_id=user["userId"],
+        session_id=session["sessionId"],
+        provider="cognito",
+        display_name=user.get("displayName"),
+        roles=roles,
+    )
+    preference_state = _preference_state(preference_repository, user["userId"])
+
+    return json_response(
+        200,
+        {
+            "authenticated": True,
+            "accessToken": access_token.token,
+            "tokenType": "Bearer",
+            "expiresIn": access_token.expires_in,
+            "session": {
+                "sessionId": session["sessionId"],
+                "expiresAt": _iso_from_epoch(session["expiresAt"]),
+            },
+            "user": _public_user(user, is_new_user=user_result.is_new_user, provider="cognito"),
+            "preferences": preference_state["preferences"],
+            "onboardingCompleted": preference_state["onboardingCompleted"],
+            "linkedProvider": "cognito",
         },
         headers={"Set-Cookie": _session_cookie(refresh_token, _refresh_ttl_seconds())},
     )
@@ -280,6 +358,38 @@ def _session_id_from_bearer(event):
     return claims.get("sid")
 
 
+def _cognito_authorizer_claims(event):
+    authorizer = ((event.get("requestContext") or {}).get("authorizer") or {})
+    jwt = authorizer.get("jwt") or {}
+    claims = jwt.get("claims")
+    if isinstance(claims, dict):
+        return claims
+    return None
+
+
+def _cognito_display_name(claims):
+    first = claims.get("given_name")
+    last = claims.get("family_name")
+    full_name = " ".join(part for part in (first, last) if part)
+    return (
+        claims.get("name")
+        or full_name
+        or claims.get("nickname")
+        or claims.get("preferred_username")
+        or claims.get("cognito:username")
+        or claims.get("username")
+        or "Lovv User"
+    )
+
+
+def _claim_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes")
+    return False
+
+
 def _session_cookie(refresh_token, max_age):
     return _cookie_value(refresh_token, max_age)
 
@@ -360,6 +470,10 @@ def _public_user(user, is_new_user=None, provider=None):
     }
     if provider:
         result["provider"] = provider
+    if user.get("cognitoSub"):
+        result["cognitoSub"] = user.get("cognitoSub")
+    if "emailVerified" in user:
+        result["emailVerified"] = bool(user.get("emailVerified"))
     if is_new_user is not None:
         result["isNewUser"] = bool(is_new_user)
     return result

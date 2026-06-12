@@ -79,6 +79,12 @@ def make_event(method, path, body=None, headers=None, cookies=None, authorizer_c
     return event
 
 
+def make_cognito_event(method, path, claims):
+    event = make_event(method, path, headers={"authorization": "Bearer cognito-access-token"})
+    event["requestContext"]["authorizer"] = {"jwt": {"claims": claims}}
+    return event
+
+
 class AuthAppTest(unittest.TestCase):
     def setUp(self):
         self.provider_verifier = FakeProviderVerifier()
@@ -216,6 +222,93 @@ class AuthAppTest(unittest.TestCase):
                 "https://lovv.example/auth/callback/google",
             )
             self.assertEqual(self.provider_verifier.calls[0]["code_verifier"], "google-pkce-verifier")
+
+    def test_cognito_session_bootstraps_lovv_user_from_jwt_authorizer_claims_with_user_role(self):
+        with patch.dict(os.environ, AUTH_ENV, clear=True):
+            response = self.request(
+                make_cognito_event(
+                    "POST",
+                    "/api/v1/auth/cognito/session",
+                    {
+                        "sub": "cognito-sub-123",
+                        "email": "user@example.com",
+                        "email_verified": "true",
+                        "name": "Cognito User",
+                        "picture": "https://images.example.com/cognito.png",
+                        "cognito:groups": ["R-ADMIN", "UNKNOWN-ROLE"],
+                    },
+                )
+            )
+            body = json.loads(response["body"])
+
+            self.assertEqual(response["statusCode"], 200)
+            self.assertTrue(body["authenticated"])
+            self.assertEqual(body["tokenType"], "Bearer")
+            self.assertEqual(body["linkedProvider"], "cognito")
+            self.assertEqual(body["user"]["provider"], "cognito")
+            self.assertEqual(body["user"]["cognitoSub"], "cognito-sub-123")
+            self.assertEqual(body["user"]["email"], "user@example.com")
+            self.assertEqual(body["user"]["emailVerified"], True)
+            self.assertEqual(body["user"]["displayName"], "Cognito User")
+            self.assertEqual(body["user"]["roles"], ["R-USER"])
+            self.assertTrue(body["user"]["isNewUser"])
+            self.assertFalse(body["onboardingCompleted"])
+            self.assertIsNone(body["preferences"])
+            self.assertIn("lovv_session=", response["headers"]["Set-Cookie"])
+            self.assertEqual(len(self.provider_verifier.calls), 0)
+            self.assertIn(("cognito", "cognito-sub-123"), self.user_repository.social_accounts)
+
+            token_claims = verify_access_token(body["accessToken"])
+            self.assertEqual(token_claims["sub"], body["user"]["userId"])
+            self.assertEqual(token_claims["provider"], "cognito")
+            self.assertEqual(token_claims["roles"], ["R-USER"])
+
+    def test_cognito_session_reuses_cognito_subject_and_returns_preferences_alias(self):
+        with patch.dict(os.environ, AUTH_ENV, clear=True):
+            claims = {
+                "sub": "cognito-sub-123",
+                "email": "user@example.com",
+                "email_verified": "true",
+                "name": "Cognito User",
+            }
+            first = self.request(make_cognito_event("POST", "/api/v1/auth/cognito/session", claims))
+            first_body = json.loads(first["body"])
+            user_id = first_body["user"]["userId"]
+            self.preference_repository.upsert(
+                user_id,
+                {
+                    "countryTrack": "KR",
+                    "mappedThemes": ["history_tradition"],
+                    "preferredRegions": ["gyeongbuk"],
+                    "selectedCityStyle": "GYEONGJU",
+                    "pace": "balanced",
+                    "tripDays": 3,
+                    "companionStyle": "solo",
+                    "travelStyles": ["slow_walk"],
+                },
+            )
+
+            second = self.request(make_cognito_event("POST", "/api/v1/auth/cognito/session", claims))
+            second_body = json.loads(second["body"])
+
+            self.assertEqual(first["statusCode"], 200)
+            self.assertEqual(second["statusCode"], 200)
+            self.assertTrue(first_body["user"]["isNewUser"])
+            self.assertFalse(second_body["user"]["isNewUser"])
+            self.assertEqual(second_body["user"]["userId"], user_id)
+            self.assertTrue(second_body["onboardingCompleted"])
+            self.assertEqual(second_body["preferences"]["mappedThemes"], ["history_tradition"])
+            self.assertEqual(second_body["preferences"]["selectedThemeIds"], ["history_tradition"])
+            self.assertEqual(len(self.user_repository.users), 1)
+
+    def test_cognito_session_rejects_missing_authorizer_claims_before_initializing_repositories(self):
+        with patch.dict(os.environ, AUTH_ENV, clear=True):
+            response = handle_request(make_event("POST", "/api/v1/auth/cognito/session"))
+            body = json.loads(response["body"])
+
+            self.assertEqual(response["statusCode"], 401)
+            self.assertEqual(body["error"]["code"], "UNAUTHORIZED")
+            self.assertEqual(response["headers"]["Access-Control-Allow-Origin"], "http://localhost:5173")
 
     def test_login_rejects_invalid_provider_token(self):
         with patch.dict(os.environ, AUTH_ENV, clear=True):
