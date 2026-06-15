@@ -33,10 +33,12 @@ Development is standardized as:
 - Database: `lovvdev`
 - DynamoDB prefix: `lovv_dev_`
 - SSM prefix: `/lovv/dev/`
+- Image CDN: CloudFront distribution with OAC read-only access to the private image bucket.
 
 Use `infra/data-stack/parameters/dev.parameters.example.json` as the single development parameter source. Replace placeholder subnet and security group IDs with actual development VPC values before deployment.
 The template now creates the development VPC, two private subnets, and RDS security group directly, so separate subnet or security group IDs are not required for the default dev deployment.
 The template also creates VPC Endpoints for Secrets Manager, SSM, DynamoDB, and S3 so SAM Lambda functions in the private subnets can reach required AWS services without a NAT Gateway.
+The template creates a read-only CloudFront distribution for the image bucket. Frontend code must use the CloudFront base URL from `/lovv/dev/cloudfront/image_base_url`, not the direct S3 bucket URL.
 
 ## Report
 
@@ -49,5 +51,8 @@ reports/data_stack_build_report.md
 SAM developers and agents should read the report section `SAM Integration Notes` before adding Lambda `VpcConfig`, database environment variables, Secrets Manager permissions, DynamoDB permissions, or S3 image-bucket permissions.
 
 For VPC access patterns, read the report section `VPC Connection Guide`.
+
+For frontend image delivery, read the report section `Image CDN Frontend Handoff`. The CloudFront endpoint allows only `GET` and `HEAD`, and its S3 bucket policy grants only `s3:GetObject` through OAC.
+Frontend handoff summary: `reports/image_cdn_frontend_handoff_20260615_ko.md`
 
 For Auth, Preference, Saved Plans, and Reaction APIs, read `docs/SPEC/service_api_schema_extension_spec.md` before changing RDS tables, DynamoDB auth sessions, or service reference queries.

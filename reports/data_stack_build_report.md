@@ -18,6 +18,7 @@ Included:
 - RDS schema SQL for the PR #1 tables plus service API extensions.
 - DynamoDB table, GSI, and TTL provisioning, including refresh-token auth sessions.
 - S3 image bucket provisioning.
+- CloudFront image CDN provisioning with OAC read-only access to the private S3 image bucket.
 - SSM parameters and CloudFormation outputs for SAM integration.
 
 Excluded:
@@ -79,6 +80,7 @@ Development usage is standardized on these values:
 | RDS deletion protection | `true` |
 | DynamoDB prefix | `lovv_dev_` |
 | S3 image bucket | `lovv-image-dev-{AWS::AccountId}` |
+| Image CDN | CloudFront distribution with OAC |
 | SSM parameter prefix | `/lovv/dev/` |
 
 The current dev template creates its own development VPC, two private subnets, and RDS security group. Separate subnet IDs and security group IDs are not required for the default dev deployment.
@@ -101,6 +103,7 @@ Notes:
 - The template creates private subnets for RDS.
 - The template creates a development RDS security group with MySQL ingress controlled by `DevMysqlIngressCidr`.
 - The template creates VPC Endpoints for Secrets Manager, SSM, DynamoDB, and S3.
+- The template creates a CloudFront distribution that reads the image bucket through OAC.
 - The template does not create a NAT Gateway.
 - Keep `RDSDeletionProtection=true` unless explicitly testing teardown.
 - The template uses RDS managed master user password. The generated secret ARN is published, not the password.
@@ -146,6 +149,8 @@ The stack publishes these SSM parameters for development:
 /lovv/dev/ddb/visitor_statistics
 /lovv/dev/ddb/auth_sessions
 /lovv/dev/s3/image_bucket
+/lovv/dev/cloudfront/image_domain
+/lovv/dev/cloudfront/image_base_url
 ```
 
 SAM Lambdas should consume these values through environment variables or runtime parameter lookup. SAM must not own these resources.
@@ -168,7 +173,7 @@ Store the value in the PRD logical format:
 
 This keeps the value contract while avoiding special characters in the physical GSI key attribute name.
 
-# 8. S3 Image Key Contract
+# 8. S3 Image Key and CDN Contract
 
 Application code should write objects under these prefixes:
 
@@ -181,6 +186,56 @@ tmp/{upload_session_id}/{object_name}
 The `tmp/` prefix expires after 7 days in the v0.1 template.
 
 Direct public object access is blocked. Use CloudFront or presigned URLs for delivery.
+
+## 8.1 Read-Only CloudFront Delivery
+
+The Data Stack creates a CloudFront distribution for frontend image delivery.
+
+Security contract:
+
+- S3 public access block remains fully enabled.
+- CloudFront uses Origin Access Control with SigV4 signing.
+- The image bucket policy allows the CloudFront distribution only `s3:GetObject`.
+- CloudFront viewer methods are limited to `GET` and `HEAD`.
+- CloudFront is not granted `s3:PutObject`, `s3:DeleteObject`, `s3:DeleteObjectVersion`, `s3:ListBucket`, `s3:PutBucketPolicy`, or `s3:PutBucketPublicAccessBlock`.
+- Existing S3 files may be read through CloudFront, but this image CDN plan does not delete any existing S3 file.
+- Existing S3 objects must not be overwritten, deleted, or re-compressed in place as part of image delivery.
+
+Image compression policy:
+
+- Current read-only delivery serves the existing S3 object bytes through CloudFront.
+- Recommended image size is `0.5MB` or less per delivered object.
+- Final acceptable ceiling is less than `1MB` per delivered object.
+- If optimized derivatives are needed later, create them through a separate approved pipeline and key contract instead of mutating existing objects in place.
+
+Published CDN identifiers:
+
+```text
+/lovv/dev/cloudfront/image_domain
+/lovv/dev/cloudfront/image_base_url
+```
+
+## 8.2 Image CDN Frontend Handoff
+
+After the stack is created, pass these items to the frontend owner:
+
+| Item | Value source | Notes |
+| --- | --- | --- |
+| CDN base URL | `/lovv/dev/cloudfront/image_base_url` | Example: `https://dxxxxx.cloudfront.net` |
+| CDN domain | `/lovv/dev/cloudfront/image_domain` | Domain only, without `https://` |
+| URL rule | `<cdn-base-url>/<s3-object-key>` | Frontend must not use direct S3 URLs |
+| Allowed methods | CloudFront behavior | `GET`, `HEAD` only |
+| Image size policy | This report | Recommended `<0.5MB`, ceiling `<1MB` |
+| Fallback image key | Product/team decision | Example placeholder: `common/fallback.webp` |
+| Error handling | Frontend implementation | Use fallback on `403` or `404` |
+| Cache update rule | CloudFront operation | Reusing the same object key may require invalidation |
+
+Frontend examples:
+
+```text
+https://dxxxxx.cloudfront.net/content/KR/city/KR-Gangneung/main.webp
+https://dxxxxx.cloudfront.net/avatar/user-hash/profile.webp
+```
 
 # 9. SAM Integration Notes
 
@@ -207,6 +262,8 @@ SAM should read these values from SSM Parameter Store or receive them as deploym
 /lovv/dev/ddb/visitor_statistics
 /lovv/dev/ddb/auth_sessions
 /lovv/dev/s3/image_bucket
+/lovv/dev/cloudfront/image_domain
+/lovv/dev/cloudfront/image_base_url
 ```
 
 ## 9.2 Lambda to RDS Connectivity
@@ -481,6 +538,8 @@ aws ssm get-parameter --name /lovv/dev/network/private_subnet_c
 aws ssm get-parameter --name /lovv/dev/network/rds_security_group
 aws ssm get-parameter --name /lovv/dev/network/endpoint_security_group
 aws ssm get-parameter --name /lovv/dev/s3/image_bucket
+aws ssm get-parameter --name /lovv/dev/cloudfront/image_domain
+aws ssm get-parameter --name /lovv/dev/cloudfront/image_base_url
 aws ssm get-parameter --name /lovv/dev/ddb/user_event_logs
 aws ssm get-parameter --name /lovv/dev/ddb/agent_runs
 aws ssm get-parameter --name /lovv/dev/ddb/festival_verify_cache
@@ -551,6 +610,7 @@ aws s3api get-public-access-block --bucket $bucket
 aws s3api get-bucket-encryption --bucket $bucket
 aws s3api get-bucket-versioning --bucket $bucket
 aws s3api get-bucket-lifecycle-configuration --bucket $bucket
+aws s3api get-bucket-policy --bucket $bucket
 ```
 
 Expected:
@@ -559,6 +619,25 @@ Expected:
 - Default encryption is enabled.
 - Versioning is enabled.
 - `tmp/` lifecycle expiration exists.
+- Bucket policy grants CloudFront only `s3:GetObject` through OAC.
+- Bucket policy does not grant CloudFront write, delete, or list actions.
+
+## 12.6 Image CDN
+
+```powershell
+$imageBaseUrl = aws ssm get-parameter --name /lovv/dev/cloudfront/image_base_url --query "Parameter.Value" --output text
+aws cloudfront get-distribution --id <ImageCdnDistributionId>
+```
+
+Expected:
+
+- CloudFront origin is the S3 bucket regional domain, not the S3 website endpoint.
+- Origin uses the image OAC.
+- Default cache behavior allows only `GET` and `HEAD`.
+- Viewer protocol policy redirects HTTP to HTTPS.
+- Automatic compression is enabled for compressible objects.
+- A known image key loads through `$imageBaseUrl/<s3-object-key>`.
+- Direct S3 object URL access remains blocked.
 
 # 13. Non-Production Destroy
 

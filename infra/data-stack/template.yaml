@@ -601,6 +601,72 @@ Resources:
         - Key: StackBoundary
           Value: DataStack
 
+  # 이미지 CDN용 OAC: CloudFront가 S3 REST endpoint에 SigV4 서명 요청을 보내도록 한다.
+  ImageCloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub lovv-${EnvName}-image-oac
+        Description: !Sub Read-only OAC for Lovv ${EnvName} image bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # 이미지 CDN: 프론트에는 S3 URL 대신 이 CloudFront endpoint만 전달한다.
+  ImageCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub Lovv ${EnvName} read-only image CDN.
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: LovvImageBucketOrigin
+            DomainName: !GetAtt ImageBucket.RegionalDomainName
+            OriginAccessControlId: !Ref ImageCloudFrontOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: LovvImageBucketOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Project
+          Value: Lovv
+        - Key: Environment
+          Value: !Ref EnvName
+        - Key: StackBoundary
+          Value: DataStack
+
+  # 이미지 버킷 정책: CloudFront OAC distribution에만 객체 읽기 권한을 부여한다.
+  ImageBucketReadOnlyPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImageBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontReadOnlyGetObject
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${ImageBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${ImageCloudFrontDistribution}
+
   # SAM 앱 스택이 RDS host를 직접 하드코딩하지 않도록 SSM parameter로 공개한다.
   RDSHostParameter:
     Type: AWS::SSM::Parameter
@@ -729,6 +795,20 @@ Resources:
       Type: String
       Value: !Ref ImageBucket
 
+  ImageCdnDomainParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /lovv/${EnvName}/cloudfront/image_domain
+      Type: String
+      Value: !GetAtt ImageCloudFrontDistribution.DomainName
+
+  ImageCdnBaseUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /lovv/${EnvName}/cloudfront/image_base_url
+      Type: String
+      Value: !Sub https://${ImageCloudFrontDistribution.DomainName}
+
 # Outputs: 배포 직후 CloudFormation 콘솔/CLI에서 확인할 수 있는 주요 식별자이다.
 Outputs:
   VpcId:
@@ -758,6 +838,15 @@ Outputs:
   ImageBucketName:
     Description: S3 image bucket name.
     Value: !Ref ImageBucket
+  ImageCdnDistributionId:
+    Description: Read-only CloudFront distribution ID for the S3 image bucket.
+    Value: !Ref ImageCloudFrontDistribution
+  ImageCdnDomainName:
+    Description: Read-only CloudFront distribution domain for frontend image delivery.
+    Value: !GetAtt ImageCloudFrontDistribution.DomainName
+  ImageCdnBaseUrl:
+    Description: HTTPS base URL for frontend image delivery.
+    Value: !Sub https://${ImageCloudFrontDistribution.DomainName}
   UserEventLogsTableName:
     Value: !Ref UserEventLogsTable
   AgentRunsTableName:
